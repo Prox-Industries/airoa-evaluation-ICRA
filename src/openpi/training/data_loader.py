@@ -1,14 +1,21 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import shutil
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.common.datasets.utils as _lerobot_utils
 import numpy as np
+
+# LeRobot が HuggingFace Hub で revision を検証しようとするのをパッチで無効化
+# ローカルデータセット使用時に不要なネットワーク接続を防ぐ
+_lerobot_utils.get_safe_version = lambda repo_id, revision: revision or "main"
 import torch
 
 import openpi.models.model as _model
@@ -127,23 +134,408 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _build_filtered_meta_root(
+    source_root: str,
+    repo_id: str,
+    task_names: list[str] | None,
+    success_only: bool,
+    max_episodes_per_task: int | None,
+    cache_dir: str = "/opt/dlami/nvme/filtered_meta",
+) -> str:
+    """episodes.jsonl を早期終了スキャンで絞り込み、ローカルSSDに小さな meta を作成する。
+
+    data/ と videos/ はシンボリックリンクで R2 マウントを参照するため、
+    LeRobot は高速なローカル meta + R2 経由のデータ読み込みを行う。
+
+    Returns:
+        フィルタ済み meta を含むローカルディレクトリのパス（repo_id の親）
+    """
+    dataset_source = os.path.join(source_root, repo_id)
+    # キャッシュキーを設定から生成
+    key_parts = [
+        repo_id.replace("/", "_"),
+        f"tasks={'_'.join(sorted(task_names or []))[:40]}",
+        f"success={success_only}",
+        f"max={max_episodes_per_task}",
+    ]
+    cache_key = "_".join(key_parts)
+    local_dataset = os.path.join(cache_dir, cache_key, repo_id)
+    local_meta = os.path.join(local_dataset, "meta")
+    done_flag = os.path.join(local_meta, ".done")
+
+    if os.path.exists(done_flag):
+        logging.info("フィルタ済み meta キャッシュを再利用: %s", local_meta)
+        return os.path.join(cache_dir, cache_key)
+
+    logging.info("フィルタ済み meta を作成中: %s", local_meta)
+    os.makedirs(local_meta, exist_ok=True)
+
+    # info.json / tasks.jsonl をコピー（小さいファイルのみ、episodes_stats.jsonlは42GBのため除外）
+    for fname in ("info.json", "tasks.jsonl"):
+        src = os.path.join(dataset_source, "meta", fname)
+        dst = os.path.join(local_meta, fname)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy(src, dst)
+
+    # episodes.jsonl を早期終了スキャンで絞り込む
+    episodes_src = os.path.join(dataset_source, "meta", "episodes.jsonl")
+    count_per_task: dict[str, int] = {}
+    selected_lines: list[str] = []
+
+    with open(episodes_src) as f:
+        for line in f:
+            ep = json.loads(line)
+
+            # success フィルタ
+            if success_only and not ep.get("task_success", True):
+                continue
+
+            # task name フィルタ（short_horizon_task フィールドで照合）
+            sht = ep.get("short_horizon_task", "")
+            ep_tasks: list[str] = ep.get("tasks", [])
+            if task_names:
+                # short_horizon_task が task_names のいずれかに完全一致するか確認
+                task_key = next((tn for tn in task_names if tn.lower() == sht.lower()), None)
+                if task_key is None:
+                    continue
+            else:
+                task_key = sht if sht else (ep_tasks[0] if ep_tasks else "__all__")
+
+            # per-task 上限
+            if max_episodes_per_task is not None:
+                if count_per_task.get(task_key, 0) >= max_episodes_per_task:
+                    continue
+                count_per_task[task_key] = count_per_task.get(task_key, 0) + 1
+
+            selected_lines.append(line if line.endswith("\n") else line + "\n")
+
+            # 全タスクが上限に達したら早期終了
+            if (
+                max_episodes_per_task is not None
+                and task_names is not None
+                and all(count_per_task.get(t, 0) >= max_episodes_per_task for t in task_names)
+            ):
+                break
+
+    if not selected_lines:
+        raise ValueError(
+            f"フィルタ条件に一致するエピソードがありません: "
+            f"task_names={task_names}, success_only={success_only}"
+        )
+
+    with open(os.path.join(local_meta, "episodes.jsonl"), "w") as f:
+        f.writelines(selected_lines)
+
+    logging.info(
+        "episodes.jsonl フィルタ完了: %d エピソード選択 %s",
+        len(selected_lines), dict(count_per_task),
+    )
+
+    # data/ と videos/ はシンボリックリンクで R2 マウントを参照
+    for dname in ("data", "videos"):
+        link = os.path.join(local_dataset, dname)
+        target = os.path.join(dataset_source, dname)
+        if not os.path.exists(link) and os.path.exists(target):
+            os.symlink(target, link)
+
+    # 完了フラグ
+    open(done_flag, "w").close()
+    return os.path.join(cache_dir, cache_key)
+
+
+class DirectParquetDataset(torch.utils.data.Dataset):
+    """Lightweight dataset that reads parquet + video directly from S3 mount.
+
+    Bypasses LeRobotDataset's heavy initialization which tries to scan all 2.5M
+    episodes (140GB metadata). Instead, reads only the filtered episodes' parquet
+    files (24KB each) and decodes video frames (243KB each) on demand.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        repo_id: str,
+        episodes: list[dict],
+        tasks: dict[int, str],
+        action_horizon: int,
+        fps: float,
+        action_sequence_keys: tuple[str, ...],
+    ):
+        self.dataset_dir = os.path.join(data_root, repo_id)
+        self.action_horizon = action_horizon
+        self.fps = fps
+        self.action_sequence_keys = action_sequence_keys
+        self.tasks = tasks
+
+        # Read all parquet data upfront (150 episodes × ~24KB = ~3.6MB on disk).
+        # Decompressed in memory this is still tiny.
+        self._episode_tables: dict[int, "pyarrow.Table"] = {}
+        self._frames: list[tuple[int, int]] = []  # (episode_index, frame_index)
+
+        import pyarrow.parquet as pq
+
+        for ep in episodes:
+            ep_idx = ep["episode_index"]
+            pq_path = self._parquet_path(ep_idx)
+            try:
+                table = pq.read_table(pq_path)
+            except Exception as e:
+                logging.warning("Skipping episode %d: %s", ep_idx, e)
+                continue
+
+            num_frames = table.num_rows
+            self._episode_tables[ep_idx] = table
+
+            # Only include frames where full action horizon is available
+            valid = max(0, num_frames - action_horizon + 1)
+            for f in range(valid):
+                self._frames.append((ep_idx, f))
+
+        if not self._frames:
+            raise ValueError("No valid frames found in any episode")
+
+        logging.info(
+            "DirectParquetDataset: %d episodes, %d frames",
+            len(self._episode_tables), len(self._frames),
+        )
+
+    def _parquet_path(self, ep_idx: int) -> str:
+        chunk = ep_idx // 1000
+        return os.path.join(
+            self.dataset_dir,
+            f"data/chunk-{chunk:03d}/episode_{ep_idx:06d}.parquet",
+        )
+
+    def _video_path(self, ep_idx: int, camera: str) -> str:
+        chunk = ep_idx // 1000
+        return os.path.join(
+            self.dataset_dir,
+            f"videos/chunk-{chunk:03d}/observation.image.{camera}/episode_{ep_idx:06d}.mp4",
+        )
+
+    def _decode_frame(self, ep_idx: int, camera: str, frame_idx: int) -> np.ndarray:
+        """Decode a single frame from video. Returns uint8 [H, W, 3]."""
+        import av
+
+        path = self._video_path(ep_idx, camera)
+        with av.open(path) as container:
+            stream = container.streams.video[0]
+            # Videos are small (~243KB, ~142 frames) so sequential decode is fast
+            for i, frame in enumerate(container.decode(stream)):
+                if i == frame_idx:
+                    return frame.to_ndarray(format="rgb24")
+
+        raise RuntimeError(f"Could not decode frame {frame_idx} from {path}")
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+    def __getitem__(self, index) -> dict:
+        ep_idx, frame_idx = self._frames[index]
+        table = self._episode_tables[ep_idx]
+
+        # --- State ---
+        state = np.array(
+            table.column("observation.state")[frame_idx].as_py(),
+            dtype=np.float32,
+        )
+
+        # --- Actions (stack action_horizon frames) ---
+        result: dict = {
+            "observation.state": state,
+        }
+        for key in self.action_sequence_keys:
+            col = table.column(key)
+            chunk = np.stack(
+                [
+                    np.array(col[frame_idx + t].as_py(), dtype=np.float32)
+                    for t in range(self.action_horizon)
+                ]
+            )
+            result[key] = chunk
+
+        # --- Images (decode from video) ---
+        result["observation.image.head"] = self._decode_frame(ep_idx, "head", frame_idx)
+        result["observation.image.hand"] = self._decode_frame(ep_idx, "hand", frame_idx)
+
+        # --- Prompt from task_index ---
+        task_index = int(table.column("task_index")[frame_idx].as_py())
+        if self.tasks:
+            prompt = self.tasks.get(task_index, f"task_{task_index}")
+            result["prompt"] = prompt
+        result["task_index"] = task_index
+
+        return result
+
+
+def _load_tasks_jsonl(meta_dir: str) -> dict[int, str]:
+    """Load tasks.jsonl and return {task_index: task_string} mapping."""
+    tasks_path = os.path.join(meta_dir, "tasks.jsonl")
+    tasks = {}
+    if os.path.exists(tasks_path):
+        with open(tasks_path) as f:
+            for line in f:
+                obj = json.loads(line)
+                tasks[obj["task_index"]] = obj["task"]
+    return tasks
+
+
+def _filter_episodes(
+    source_root: str,
+    repo_id: str,
+    task_names: list[str] | None,
+    success_only: bool,
+    max_episodes_per_task: int | None,
+) -> list[dict]:
+    """Scan episodes.jsonl and return filtered episode dicts.
+
+    Uses early termination when all tasks hit max_episodes_per_task.
+    """
+    episodes_path = os.path.join(source_root, repo_id, "meta", "episodes.jsonl")
+    count_per_task: dict[str, int] = {}
+    selected: list[dict] = []
+
+    logging.info("Scanning episodes.jsonl (early-exit filtering)...")
+    with open(episodes_path) as f:
+        for line in f:
+            ep = json.loads(line)
+
+            if success_only and not ep.get("task_success", True):
+                continue
+
+            sht = ep.get("short_horizon_task", "")
+            if task_names:
+                task_key = next(
+                    (tn for tn in task_names if tn.lower() == sht.lower()), None
+                )
+                if task_key is None:
+                    continue
+            else:
+                task_key = sht or "__all__"
+
+            if max_episodes_per_task is not None:
+                if count_per_task.get(task_key, 0) >= max_episodes_per_task:
+                    continue
+                count_per_task[task_key] = count_per_task.get(task_key, 0) + 1
+
+            selected.append(ep)
+
+            # Early exit when all tasks are full
+            if (
+                max_episodes_per_task is not None
+                and task_names is not None
+                and all(
+                    count_per_task.get(t, 0) >= max_episodes_per_task
+                    for t in task_names
+                )
+            ):
+                break
+
+    logging.info("Filtered episodes: %d selected %s", len(selected), dict(count_per_task))
+    if not selected:
+        raise ValueError(
+            f"No episodes match filter: task_names={task_names}, success_only={success_only}"
+        )
+    return selected
+
+
+def create_direct_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    *,
+    local_root: str,
+    task_names: list[str] | None = None,
+    success_only: bool = False,
+    max_episodes_per_task: int | None = None,
+) -> "DirectParquetDataset":
+    """Create a DirectParquetDataset that bypasses LeRobotDataset.
+
+    Reads only the needed parquet/video files from S3 mount, avoiding the
+    140GB metadata scan that LeRobotDataset performs on initialization.
+    """
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set.")
+
+    # Filter episodes
+    episodes = _filter_episodes(
+        source_root=local_root,
+        repo_id=repo_id,
+        task_names=task_names,
+        success_only=success_only,
+        max_episodes_per_task=max_episodes_per_task,
+    )
+
+    # Load task name mapping
+    meta_dir = os.path.join(local_root, repo_id, "meta")
+    tasks = _load_tasks_jsonl(meta_dir)
+
+    # Read FPS from info.json
+    info_path = os.path.join(meta_dir, "info.json")
+    with open(info_path) as f:
+        info = json.loads(f.read())
+    fps = info.get("fps", 10)
+
+    return DirectParquetDataset(
+        data_root=local_root,
+        repo_id=repo_id,
+        episodes=episodes,
+        tasks=tasks,
+        action_horizon=action_horizon,
+        fps=fps,
+        action_sequence_keys=data_config.action_sequence_keys,
+    )
+
+
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    local_root: str | None = None,
+    task_names: list[str] | None = None,
+    success_only: bool = False,
+    max_episodes_per_task: int | None = None,
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset for training.
+
+    Args:
+        local_root: If set, load the dataset from this local directory instead of HuggingFace Hub.
+                    The dataset is expected to be at ``<local_root>/<repo_id>/``.
+        task_names: If set, only episodes whose task description contains one of these strings
+                    (case-insensitive substring match) will be included.
+        success_only: If True, only include episodes where task_success is True.
+        max_episodes_per_task: If set, cap the number of episodes per matched task.
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # フィルタ条件がある場合: 早期終了スキャンでローカルに小さな meta を作成し
+    # LeRobot が 2.5M 行の episodes.jsonl を全件読まないようにする
+    if local_root and (task_names or success_only or max_episodes_per_task is not None):
+        local_root = _build_filtered_meta_root(
+            source_root=local_root,
+            repo_id=repo_id,
+            task_names=task_names,
+            success_only=success_only,
+            max_episodes_per_task=max_episodes_per_task,
+        )
+
+    root = os.path.join(local_root, repo_id) if local_root else None
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+    episodes = None
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
         tolerance_s=1e-3, # default is 1e-4
+        root=root,
+        episodes=episodes,
         # video_backend="pyav",
     )
 

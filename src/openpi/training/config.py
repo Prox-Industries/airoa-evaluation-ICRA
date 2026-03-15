@@ -1181,6 +1181,37 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
+    TrainConfig(
+        name="pi05_hsr_mydata",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotHSRDataConfig(
+            repo_id="airoa-hsr-all-v1.1-202504-202512-baseline-75tasks-10000hours",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_hsr_mydata",
+                asset_id="airoa-hsr-all-v1.1-202504-202512-baseline-75tasks-10000hours",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            action_mode="state_diff_arm_head_relative_gripper_base",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1.0e-4,
+            decay_steps=10_000,
+            decay_lr=1.0e-5,
+        ),
+        pytorch_weight_path="./checkpoints/lerobot_pi05_base/model.safetensors",
+        batch_size=128,
+        num_workers=16,
+        num_train_steps=1_000,
+        save_interval=200,
+        log_interval=20,
+    ),
     #
     # Debugging configs.
     #
@@ -1252,6 +1283,10 @@ _CONFIGS = [
         num_train_steps=1_300_000,
     ),
 ]
+
+# Register custom configs from configs/ subpackage.
+from openpi.training.configs.my_robot_pi05_lora import MY_ROBOT_PI05_LORA_CONFIGS
+_CONFIGS.extend(MY_ROBOT_PI05_LORA_CONFIGS)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

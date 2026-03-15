@@ -81,6 +81,33 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation wrapper for nn.Linear.
+
+    Freezes the original weight and adds trainable low-rank A/B matrices.
+    Output = original(x) + (x @ A^T @ B^T) * (alpha / rank)
+    B is zero-initialized so LoRA starts as identity (no change to base model).
+    """
+
+    def __init__(self, original: nn.Linear, rank: int, alpha: float = 1.0):
+        super().__init__()
+        self.original = original
+        self.original.weight.requires_grad_(False)
+        if self.original.bias is not None:
+            self.original.bias.requires_grad_(False)
+
+        self.lora_A = nn.Parameter(torch.empty(rank, original.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(original.out_features, rank))
+        self.scaling = alpha / rank
+
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x):
+        base = self.original(x)
+        lora = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
+        return base + lora
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -122,6 +149,54 @@ class PI0Pytorch(nn.Module):
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+    def apply_lora_finetuning(self, rank: int = 16, alpha: float = 32.0) -> dict[str, int]:
+        """Apply LoRA to Action Expert + unfreeze projections. Freeze everything else.
+
+        Architecture after this call:
+          - SigLIP (vision):     frozen
+          - PaliGemma (2B LLM):  frozen
+          - Action Expert (300M): frozen base + LoRA on q_proj/v_proj
+          - Projection layers:   trainable (action_in/out_proj, time_mlp)
+
+        Args:
+            rank: LoRA rank (default 16)
+            alpha: LoRA scaling factor (default 32, i.e. 2x rank)
+        """
+        # 1. Freeze everything
+        self.requires_grad_(False)
+
+        # 2. Apply LoRA to Action Expert attention layers (q_proj, v_proj)
+        expert = self.paligemma_with_expert.gemma_expert
+        lora_count = 0
+        for layer in expert.model.layers:
+            attn = layer.self_attn
+            attn.q_proj = LoRALinear(attn.q_proj, rank, alpha)
+            attn.v_proj = LoRALinear(attn.v_proj, rank, alpha)
+            lora_count += 2
+
+        # 3. Unfreeze projection layers
+        self.action_in_proj.requires_grad_(True)
+        self.action_out_proj.requires_grad_(True)
+        if self.pi05:
+            self.time_mlp_in.requires_grad_(True)
+            self.time_mlp_out.requires_grad_(True)
+        else:
+            self.state_proj.requires_grad_(True)
+            self.action_time_mlp_in.requires_grad_(True)
+            self.action_time_mlp_out.requires_grad_(True)
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        total = trainable + frozen
+
+        logging.info(
+            "LoRA finetuning: rank=%d, alpha=%.0f, %d LoRA layers, "
+            "trainable=%.1fM / total=%.1fM (%.1f%%)",
+            rank, alpha, lora_count,
+            trainable / 1e6, total / 1e6, 100.0 * trainable / total,
+        )
+        return {"trainable": trainable, "frozen": frozen, "total": total}
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
