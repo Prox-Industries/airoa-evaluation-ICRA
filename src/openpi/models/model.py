@@ -243,8 +243,40 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+
+        # Detect LoRA checkpoint by checking for lora_A/lora_B keys
+        raw_sd = safetensors.torch.load_file(weight_path)
+        lora_keys = [k for k in raw_sd if k.endswith(".lora_A")]
+        if lora_keys:
+            logger.info(f"Detected LoRA checkpoint with {len(lora_keys)} LoRA layers, merging...")
+            merged_sd = self._merge_lora_state_dict(raw_sd)
+            model.load_state_dict(merged_sd, strict=True)
+        else:
+            safetensors.torch.load_model(model, weight_path)
         return model
+
+    @staticmethod
+    def _merge_lora_state_dict(state_dict: dict, alpha: float = 32.0) -> dict:
+        """Merge LoRA A/B matrices into original weights for inference."""
+        import torch
+
+        lora_prefixes = {k[: -len(".lora_A")] for k in state_dict if k.endswith(".lora_A")}
+        merged, skip = {}, set()
+        for prefix in lora_prefixes:
+            lora_A = state_dict[f"{prefix}.lora_A"]
+            lora_B = state_dict[f"{prefix}.lora_B"]
+            orig_w = state_dict[f"{prefix}.original.weight"]
+            scaling = alpha / lora_A.shape[0]
+            merged[f"{prefix}.weight"] = orig_w + (lora_B @ lora_A) * scaling
+            skip.update([f"{prefix}.lora_A", f"{prefix}.lora_B", f"{prefix}.original.weight"])
+            if f"{prefix}.original.bias" in state_dict:
+                merged[f"{prefix}.bias"] = state_dict[f"{prefix}.original.bias"]
+                skip.add(f"{prefix}.original.bias")
+        for k, v in state_dict.items():
+            if k not in skip and k not in merged:
+                merged[k] = v
+        logger.info(f"Merged {len(lora_prefixes)} LoRA layers: {len(state_dict)} keys -> {len(merged)} keys")
+        return merged
 
     @abc.abstractmethod
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[Observation, Actions]:

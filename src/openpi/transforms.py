@@ -115,7 +115,8 @@ class CombineStateDiffAndRelativeBase(DataTransformFn):
             if self.relative_key in data:
                 data[self.output_key] = np.asarray(data[self.relative_key])
                 return data
-            raise KeyError(f"Missing {self.state_diff_key} and {self.relative_key} in data")
+            # At inference time, action keys are absent — skip silently.
+            return data
 
         state_diff = np.asarray(data[self.state_diff_key])
         if self.relative_key not in data:
@@ -159,7 +160,8 @@ class CombineStateDiffArmHeadRelativeGripperBase(DataTransformFn):
             if self.relative_key in data:
                 data[self.output_key] = np.asarray(data[self.relative_key])
                 return data
-            raise KeyError(f"Missing {self.state_diff_key} and {self.relative_key} in data")
+            # At inference time, action keys are absent — skip silently.
+            return data
 
         state_diff = np.asarray(data[self.state_diff_key])
         if self.relative_key not in data:
@@ -248,12 +250,13 @@ class Unnormalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        # Make sure that all the keys in the norm stats are present in the data.
+        # Use strict=False so that norm_stats keys absent from the data
+        # (e.g. observation.state during inference output) are silently skipped.
         return apply_tree(
             data,
             self.norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
-            strict=True,
+            strict=False,
         )
 
     def _unnormalize(self, x, stats: NormStats):

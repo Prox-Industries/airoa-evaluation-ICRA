@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Checkpoints & model weights
+checkpoints/
+*.safetensors
+*.pt
+*.ckpt
+
+# Secrets & credentials
+*.pem
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# mypy / pytest
+.mypy_cache/
+.pytest_cache/
+
+# Claude Code
+.claude/
+
+# Docker cache
+.docker_cache/
+
+# Docs (local only)
+docs/
+ARCHITECTURE.md
+
+# Misc
+*.log

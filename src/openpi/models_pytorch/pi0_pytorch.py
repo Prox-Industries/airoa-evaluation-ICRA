@@ -136,7 +136,10 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        # torch.compile disabled: nightly + Blackwell (sm_120) causes dtype mismatch
+        # in scaled_dot_product_attention, and compile overhead is problematic on
+        # evaluation hardware (RTX 5070 Ti, 16GB VRAM).
+        # self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False

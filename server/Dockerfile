@@ -1,11 +1,12 @@
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs build-essential clang ca-certificates curl && \
+    git git-lfs build-essential clang ca-certificates curl \
+    libgl1-mesa-glx libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock LICENSE README.md ./
@@ -18,6 +19,12 @@ COPY runtime_core ./runtime_core
 RUN uv venv --python 3.11 /workspace/.venv
 RUN GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-dev
 RUN uv pip install --python /workspace/.venv/bin/python pytest
+
+# Blackwell GPU (sm_120) requires PyTorch nightly with CUDA 12.8 support.
+# Override stable PyTorch installed by uv sync with nightly build.
+RUN uv pip install --python /workspace/.venv/bin/python \
+    --reinstall --pre torch torchvision \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # Support PyTorch checkpoints (same behavior as upstream serve_policy image).
 RUN /workspace/.venv/bin/python -c "import transformers; print(transformers.__file__)" | xargs dirname | xargs -I{} cp -r /workspace/src/openpi/models_pytorch/transformers_replace/* {}

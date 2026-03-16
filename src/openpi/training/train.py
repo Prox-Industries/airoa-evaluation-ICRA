@@ -203,7 +203,9 @@ def _save_checkpoint(
 
     # DDP でラップされていれば .module を取る
     raw_model = model.module if isinstance(model, DDP) else model
-    safetensors.torch.save_file(raw_model.state_dict(), str(step_dir / "model.safetensors"))
+    # Clone tied weights to avoid safetensors shared memory error
+    state_dict = {k: v.clone() for k, v in raw_model.state_dict().items()}
+    safetensors.torch.save_file(state_dict, str(step_dir / "model.safetensors"))
     torch.save({"step": step, "optimizer": optimizer.state_dict()}, str(step_dir / "optimizer.pt"))
     (checkpoint_dir / "latest").write_text(str(step))
     logger.info("Saved checkpoint at step %d -> %s", step, step_dir)
@@ -399,6 +401,9 @@ def main() -> None:
     else:
         if _is_main(rank):
             logger.info("Full fine-tuning (LoRA disabled)")
+
+    # LoRA adds new parameters on CPU; move everything to device
+    model = model.to(device)
 
     # --- torch.compile ---
     if args.compile:

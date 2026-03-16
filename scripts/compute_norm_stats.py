@@ -199,8 +199,9 @@ def compute_from_parquets(
     numeric_columns = []
     for col_name in sample_table.column_names:
         col = sample_table.column(col_name)
+        import pyarrow as pa
         if hasattr(col.type, "value_type") and col.type.value_type in (
-            pq.lib.float32(), pq.lib.float64(),
+            pa.float32(), pa.float64(),
         ):
             numeric_columns.append(col_name)
 
