@@ -252,7 +252,15 @@ class BaseModelConfig(abc.ABC):
             merged_sd = self._merge_lora_state_dict(raw_sd)
             model.load_state_dict(merged_sd, strict=True)
         else:
-            safetensors.torch.load_model(model, weight_path)
+            # Filter out unexpected keys (e.g. tied embed_tokens.weight
+            # saved during full fine-tuning but not expected as a separate parameter).
+            model_keys = set(model.state_dict().keys())
+            unexpected = [k for k in raw_sd if k not in model_keys]
+            if unexpected:
+                logger.warning(f"Dropping {len(unexpected)} unexpected key(s) from checkpoint: {unexpected}")
+                for k in unexpected:
+                    del raw_sd[k]
+            model.load_state_dict(raw_sd, strict=True)
         return model
 
     @staticmethod
