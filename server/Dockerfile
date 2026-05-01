@@ -34,15 +34,14 @@ ENV PYTHONPATH="/workspace:/workspace/src:/workspace/packages/policy-client/src"
 ENV OPENPI_DATA_HOME="/policy_assets"
 
 # OOD recovery defaults for the ICRA submission. Overridable at runtime.
-# See server/ood_recovery.py for semantics and OOD_* knobs.
+# Frame-by-frame hold mode: emit a gripper-safe hold chunk when ambiguous,
+# force release after OOD_MAX_HOLDS consecutive holds.
+# See server/ood_recovery.py for semantics.
 ENV OOD_ENABLED=1 \
     OOD_AMBIGUITY_THRESHOLD=1.15 \
     OOD_CHUNK_AGGREGATION=max \
     OOD_REQUIRE_CROSSING=1 \
-    OOD_RETRY_ON_OOD=1 \
-    OOD_MAX_RETRIES=3 \
-    OOD_PERSISTENT_ACTION=keep_last \
-    OOD_MIN_CONSECUTIVE=1 \
+    OOD_MAX_HOLDS=3 \
     OOD_PA_STRICT=1
 
 ENTRYPOINT ["/workspace/server/entrypoint.sh"]

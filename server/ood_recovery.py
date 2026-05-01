@@ -1,35 +1,45 @@
-"""OOD detection + retry-based recovery for HSR gripper.
+"""OOD detection + frame-by-frame hold recovery for HSR gripper ambiguity.
 
-Behaviour: when the model is ambiguous on a given frame, **discard the
-prediction and re-run inference (blocking)** until either the result
-clears the ambiguity threshold or ``max_retries`` is exhausted. The
-retry exploits flow-matching noise stochasticity — same observation,
-different noise draw, different prediction. After the loop, a
-``persistent_ood_action`` decides what to return if the model is still
-ambiguous (default: keep the last retry result).
+Design (stateful, across infer calls — no in-call retry loop):
 
-Pipeline per call:
-  1. Run inference with the user prompt → ``result``.
-  2. Run inference with the counterfactual prompt (Pick<->Place swap of
-     the same object family) → ``result_cf``.
-  3. Score = max (or mean) over the action chunk of
-     ``|gripper_orig - gripper_cf|``. If score >= threshold (and the
-     gripper crosses the 0.5 hybrid switch in opposite directions), the
-     frame is OOD.
-  4. If OOD, discard ``result`` and go back to step 1 with a fresh noise
-     draw. Repeat up to ``max_retries`` times.
-  5. If still OOD after all retries, apply ``persistent_ood_action``.
+  for each ``infer(obs_t)`` from the WebSocket client:
+    1. Run inference with the user prompt → ``result`` (chunk).
+    2. Run inference with the counterfactual prompt (Pick<->Place swap of
+       the same object family) → ``result_cf``.
+    3. Score = max (or mean) over the action chunk of
+       ``|gripper_orig - gripper_cf|``. The frame is OOD when the score
+       crosses ``ambiguity_threshold`` (and the gripper crosses the 0.5
+       open/close switch in opposite directions, if required).
+    4. If NOT OOD → reset the consecutive-ood counter, return the chunk.
+    5. If OOD → increment the counter and:
+         * counter <= max_holds  →  return a *hold* chunk that keeps the
+                                    robot in place for one client tick
+                                    (~100 ms). The next ``infer`` call
+                                    will receive a *fresh* obs from the
+                                    client, so retries naturally use new
+                                    observations rather than re-running
+                                    on the same one.
+         * counter >  max_holds  →  budget exhausted; reset the counter,
+                                    return the original chunk anyway.
+                                    OOD detection resumes immediately on
+                                    the next call.
+    6. The counter is also reset on prompt change (episode boundary).
 
-Cost: 2 inferences per call when OOD is not detected. When OOD fires,
-``2 + 2 * retries`` inferences. Disable entirely with
-``OOD_ENABLED=false`` (default off in the bare config; the ICRA Docker
-image enables it by default via ENV).
+The hold chunk is *gripper-safe*. Naïve zero would be interpreted by the
+client as "close gripper" because the discrete/hybrid threshold is 0.5
+(see ``deploy/hsr_policy_client/scripts/hsr_policy.py``). To keep the
+gripper at its current state (and avoid crushing held objects) we copy
+``obs["state"][5]`` into ``action[:, 5]``; the rest of the chunk is zero
+(arm/head deltas → joint hold, base velocity → no movement).
+
+Inference cost: 2 base inferences per call (orig + cf). No in-call
+retries. The wrapper is a transparent passthrough when
+``OOD_ENABLED=false`` (the library default).
 """
 from __future__ import annotations
 
 import dataclasses
 import logging
-from collections import deque
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -46,7 +56,9 @@ class _PolicyLike(Protocol):
 # 11-D HSR raw action layout (post _decode_actions_inv):
 #   [arm x5, gripper x1, head x2, base_x, base_y, base_t]
 GRIPPER_DIM = 5
-DEFAULT_GRIPPER_THRESHOLD = 0.5  # hybrid open/close switch, see hsr_policy.py
+DEFAULT_GRIPPER_THRESHOLD = 0.5  # client-side hybrid open/close switch
+ACTION_DIM = 11
+STATE_GRIPPER_DIM = 5            # obs["state"] is the 8-D HSR state vector
 
 
 # 6 known PAs (verified across all 3,971 task6911 parquets — exhaustive set
@@ -67,32 +79,15 @@ class OODRecoveryConfig:
     """Runtime config — every field has an OOD_<UPPER> env-var override."""
 
     # ---- master switch ----
-    enabled: bool = False                # ON by default in Dockerfile; library default OFF.
+    enabled: bool = False
 
     # ---- ambiguity detection ----
-    ambiguity_threshold: float = 0.1     # |g_orig - g_cf| over chunk; >= triggers
-    chunk_aggregation: str = "max"       # "max" | "mean"
+    ambiguity_threshold: float = 0.1
+    chunk_aggregation: str = "max"             # "max" | "mean"
     require_threshold_crossing: bool = True
 
-    # ---- retry-on-OOD (blocking loop) ----
-    retry_on_ood: bool = True
-    max_retries: int = 3                 # blocking attempts before giving up
-
-    # ---- fallback when retries don't clear the OOD ----
-    # "keep_last" : return the most recent (still-ambiguous) retry. Trusts the
-    #               distribution of retries to be no worse than the original.
-    # "pa_rule"   : override gripper to the PA-expected value (close=Pick,
-    #               open=Place). Safety-first.
-    # "keep_first": kept for forward compat (currently behaves like keep_last
-    #               because we rebind ``result`` per retry).
-    persistent_ood_action: str = "keep_last"
-
-    # ---- override values when persistent_ood_action == "pa_rule" ----
-    gripper_close_value: float = 0.0
-    gripper_open_value: float = 1.0
-
-    # ---- hysteresis on persistent OOD ----
-    min_consecutive_ood: int = 1
+    # ---- frame-by-frame hold budget ----
+    max_holds: int = 3                         # consecutive holds before forced release
 
     # ---- PA classifier behaviour ----
     pa_classifier_strict: bool = True
@@ -128,12 +123,7 @@ class OODRecoveryConfig:
             ambiguity_threshold=_float("OOD_AMBIGUITY_THRESHOLD", 0.1),
             chunk_aggregation=_str("OOD_CHUNK_AGGREGATION", "max"),
             require_threshold_crossing=_bool("OOD_REQUIRE_CROSSING", True),
-            retry_on_ood=_bool("OOD_RETRY_ON_OOD", True),
-            max_retries=_int("OOD_MAX_RETRIES", 3),
-            persistent_ood_action=_str("OOD_PERSISTENT_ACTION", "keep_last"),
-            gripper_close_value=_float("OOD_GRIPPER_CLOSE", 0.0),
-            gripper_open_value=_float("OOD_GRIPPER_OPEN", 1.0),
-            min_consecutive_ood=_int("OOD_MIN_CONSECUTIVE", 1),
+            max_holds=_int("OOD_MAX_HOLDS", 3),
             pa_classifier_strict=_bool("OOD_PA_STRICT", True),
             log_each_call=_bool("OOD_LOG_EACH_CALL", False),
             log_overrides=_bool("OOD_LOG_OVERRIDES", True),
@@ -171,8 +161,8 @@ def swap_pa_verb(prompt: str | None, *, strict: bool = True) -> str | None:
 
 
 class OODRecoveryPolicy:
-    """Wrap a base policy so that ambiguous-frame predictions are blocked,
-    discarded, and re-run until the ambiguity score falls below threshold.
+    """Stateful wrapper that emits a gripper-safe hold chunk on ambiguous
+    frames and forces a release after ``max_holds`` consecutive holds.
 
     Transparent passthrough when ``config.enabled`` is False.
     """
@@ -180,24 +170,23 @@ class OODRecoveryPolicy:
     def __init__(self, base_policy: _PolicyLike, config: OODRecoveryConfig):
         self._base = base_policy
         self._config = config
-        self._ood_history: deque[bool] = deque(maxlen=max(config.min_consecutive_ood, 1))
+        self._consecutive_ood_count: int = 0
+        self._last_prompt: str | None = None
         self.stats: dict[str, int] = {
             "total_calls": 0,
             "skipped_disabled": 0,
             "skipped_unknown_pa": 0,
-            "initial_ood_detected": 0,
-            "retries_attempted": 0,
-            "retry_cleared_ood": 0,
-            "persistent_ood": 0,
-            "fallback_applied": 0,
+            "ood_detected": 0,
+            "holds_emitted": 0,
+            "released_after_max_holds": 0,
+            "episode_resets": 0,
         }
         if config.enabled:
             logger.info(
-                "OOD recovery ENABLED: threshold=%.3f agg=%s hyst=%d retry=%s "
-                "max_retries=%d persistent_action=%s strict_pa=%s",
+                "OOD recovery ENABLED (frame-by-frame hold mode): "
+                "threshold=%.3f agg=%s max_holds=%d crossing_required=%s strict_pa=%s",
                 config.ambiguity_threshold, config.chunk_aggregation,
-                config.min_consecutive_ood, config.retry_on_ood,
-                config.max_retries, config.persistent_ood_action,
+                config.max_holds, config.require_threshold_crossing,
                 config.pa_classifier_strict,
             )
         else:
@@ -209,9 +198,11 @@ class OODRecoveryPolicy:
         md["ood_recovery"] = {
             "enabled": self._config.enabled,
             "config": dataclasses.asdict(self._config),
+            "mode": "frame_hold",
         }
         return md
 
+    # ----------------------------------------------------------------
     def _check_ood(
         self, result: dict, cf_prompt: str, obs: dict
     ) -> tuple[bool, float, bool]:
@@ -239,6 +230,21 @@ class OODRecoveryPolicy:
             is_amb = is_amb and crossing
         return is_amb, score, crossing
 
+    def _make_hold_action(self, T: int, obs: dict[str, Any]) -> np.ndarray:
+        """Gripper-safe hold chunk.
+
+        arm/head are delta-form (zero = joint hold), gripper is absolute
+        position (must keep the current value to avoid an unintended
+        close), base is velocity (zero = no movement).
+        """
+        hold = np.zeros((max(T, 1), ACTION_DIM), dtype=np.float32)
+        state = np.asarray(obs.get("state", np.zeros(8)), dtype=np.float32) \
+                if isinstance(obs, dict) else np.zeros(8, dtype=np.float32)
+        if state.ndim == 1 and state.shape[0] > STATE_GRIPPER_DIM:
+            hold[:, GRIPPER_DIM] = float(state[STATE_GRIPPER_DIM])
+        return hold
+
+    # ----------------------------------------------------------------
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         self.stats["total_calls"] += 1
 
@@ -247,103 +253,95 @@ class OODRecoveryPolicy:
             return self._base.infer(obs)
 
         prompt = obs.get("prompt") if isinstance(obs, dict) else None
+
+        # Episode boundary: prompt change → reset the consecutive counter.
+        if prompt != self._last_prompt:
+            if self._last_prompt is not None:
+                self.stats["episode_resets"] += 1
+            self._consecutive_ood_count = 0
+            self._last_prompt = prompt
+
         cf_prompt = swap_pa_verb(prompt, strict=self._config.pa_classifier_strict)
         pa_verb = classify_pa(prompt)
 
-        # Initial inference.
+        # Always run the user-prompt inference first.
         result = self._base.infer(obs)
 
-        # Unknown PA → cannot construct a counterfactual → skip the OOD logic.
+        # Unknown PA → cannot construct a counterfactual → skip OOD logic.
         if cf_prompt is None or pa_verb not in ("pick", "place"):
             self.stats["skipped_unknown_pa"] += 1
-            self._ood_history.clear()
-            result["ood_recovery"] = {"applied": False, "reason": "unknown_pa"}
+            self._consecutive_ood_count = 0
+            result["ood_recovery"] = {
+                "applied": False, "reason": "unknown_pa",
+                "consecutive_ood": 0,
+            }
             return result
 
-        # Detect OOD on the initial inference.
         is_ood, score, crossing = self._check_ood(result, cf_prompt, obs)
-        attempt_log = [{"attempt": 0, "score": score, "crossing": crossing,
-                        "is_ood": is_ood}]
 
-        # Blocking retry loop: discard prediction and re-infer until clean
-        # (or budget exhausted).
-        retries_done = 0
-        if is_ood and self._config.retry_on_ood:
-            self.stats["initial_ood_detected"] += 1
-            for retry_i in range(self._config.max_retries):
-                self.stats["retries_attempted"] += 1
-                retries_done += 1
-                # Discard the previous prediction; re-run with fresh noise.
-                result = self._base.infer(obs)
-                is_ood, score, crossing = self._check_ood(result, cf_prompt, obs)
-                attempt_log.append({
-                    "attempt": retry_i + 1, "score": score,
-                    "crossing": crossing, "is_ood": is_ood,
-                })
-                if not is_ood:
-                    self.stats["retry_cleared_ood"] += 1
-                    break
+        if not is_ood:
+            # Clear frame: reset counter, return chunk as-is.
+            self._consecutive_ood_count = 0
+            result["ood_recovery"] = {
+                "applied": False,
+                "is_ambiguous": False,
+                "ambiguity_score": score,
+                "crossing": crossing,
+                "consecutive_ood": 0,
+                "pa_verb": pa_verb,
+            }
+            if self._config.log_each_call:
+                logger.info(
+                    "OOD clear: pa=%s score=%.4f crossing=%s",
+                    pa_verb, score, crossing,
+                )
+            return result
+
+        # OOD detected.
+        self.stats["ood_detected"] += 1
+        self._consecutive_ood_count += 1
+
+        if self._consecutive_ood_count <= self._config.max_holds:
+            # Within the hold budget: emit a gripper-safe hold chunk.
+            self.stats["holds_emitted"] += 1
+            actions_orig = np.asarray(result["actions"])
+            T = actions_orig.shape[0] if actions_orig.ndim == 2 else 1
+            hold = self._make_hold_action(T, obs)
+            result["actions"] = hold
+            result["ood_recovery"] = {
+                "applied": True,
+                "action": "hold",
+                "consecutive_ood": self._consecutive_ood_count,
+                "max_holds": self._config.max_holds,
+                "ambiguity_score": score,
+                "crossing": crossing,
+                "pa_verb": pa_verb,
+            }
             if self._config.log_overrides:
                 logger.info(
-                    "OOD retry: pa=%s attempts=%d final_ood=%s final_score=%.4f",
-                    pa_verb, retries_done, is_ood, score,
+                    "OOD hold: pa=%s consecutive=%d/%d score=%.4f "
+                    "→ zero arm/head/base + gripper=%.4f (state-keep)",
+                    pa_verb, self._consecutive_ood_count, self._config.max_holds,
+                    score, float(hold[0, GRIPPER_DIM]),
                 )
+            return result
 
-        # Hysteresis on the post-retry status.
-        self._ood_history.append(is_ood)
-        fire = (
-            is_ood
-            and len(self._ood_history) >= self._config.min_consecutive_ood
-            and all(self._ood_history)
-        )
-
-        applied = False
-        applied_action = None
-        if fire:
-            self.stats["persistent_ood"] += 1
-            actions = np.asarray(result["actions"], dtype=np.float32)
-            if self._config.persistent_ood_action == "pa_rule":
-                override_value = (
-                    self._config.gripper_close_value if pa_verb == "pick"
-                    else self._config.gripper_open_value
-                )
-                actions[:, GRIPPER_DIM] = override_value
-                result["actions"] = actions
-                applied = True
-                applied_action = "pa_rule"
-                self.stats["fallback_applied"] += 1
-                if self._config.log_overrides:
-                    logger.info(
-                        "OOD persistent fallback (pa_rule): pa=%s score=%.4f "
-                        "set gripper=%g", pa_verb, score, override_value,
-                    )
-            elif self._config.persistent_ood_action == "keep_last":
-                applied_action = "keep_last"
-            elif self._config.persistent_ood_action == "keep_first":
-                # Forward-compat alias; behaves like keep_last in this loop.
-                applied_action = "keep_first"
-            else:
-                logger.warning(
-                    "Unknown persistent_ood_action=%r; treating as keep_last",
-                    self._config.persistent_ood_action,
-                )
-                applied_action = "keep_last"
-
-        if self._config.log_each_call:
-            logger.info(
-                "OOD call: pa=%s retries=%d final_ood=%s score=%.4f fire=%s",
-                pa_verb, retries_done, is_ood, score, fire,
-            )
-
+        # Budget exhausted: release, reset counter, OOD detection resumes
+        # immediately on the next call.
+        self.stats["released_after_max_holds"] += 1
+        self._consecutive_ood_count = 0
         result["ood_recovery"] = {
-            "applied": applied,
-            "applied_action": applied_action,
-            "pa_verb": pa_verb,
+            "applied": False,
+            "action": "released_after_max_holds",
             "ambiguity_score": score,
             "crossing": crossing,
-            "is_ambiguous": is_ood,
-            "retries": retries_done,
-            "attempts": attempt_log,
-            "history_len": len(self._ood_history),
+            "pa_verb": pa_verb,
+            "max_holds": self._config.max_holds,
         }
+        if self._config.log_overrides:
+            logger.info(
+                "OOD release: pa=%s held %d frames, releasing original chunk; "
+                "counter reset, detection resumes next call",
+                pa_verb, self._config.max_holds,
+            )
         return result

@@ -11,7 +11,7 @@
 
 | Item | Value |
 |---|---|
-| Model summary | Pi0.5 baseline 100K + rank-8 LoRA corrective micro-FT (1000 steps) folded into the weights, with an A1' base-velocity clip and a counterfactual-prompt OOD recovery loop |
+| Model summary | Pi0.5 baseline 100K + rank-8 LoRA corrective micro-FT (1000 steps) folded into the weights, with an A1' base-velocity clip and a frame-by-frame OOD recovery (gripper-safe hold + forced release after 3 consecutive holds) |
 | Framework | OpenPI (PI0Pytorch) |
 | Repository | `https://github.com/Prox-Industries/airoa-evaluation-ICRA` |
 | Branch | `sample-openpi` |
@@ -78,10 +78,7 @@ unset is fine.**
 #   OOD_AMBIGUITY_THRESHOLD=1.15
 #   OOD_CHUNK_AGGREGATION=max
 #   OOD_REQUIRE_CROSSING=1
-#   OOD_RETRY_ON_OOD=1
-#   OOD_MAX_RETRIES=3
-#   OOD_PERSISTENT_ACTION=keep_last
-#   OOD_MIN_CONSECUTIVE=1
+#   OOD_MAX_HOLDS=3
 #   OOD_PA_STRICT=1
 ```
 
@@ -174,12 +171,20 @@ evaluation RTX 5070 Ti. Subsequent calls run at ≈ 2–5 Hz.
   2. **Action post-processing (A1' clip)** — hard caps in
      `_encode_actions`: `base_x/y ±0.3`, `base_t ±1.5`. The model learnt
      a soft cap during micro-FT; this clip is a runtime safety net.
-  3. **Inference-time control flow (OOD recovery)** — when the gripper
-     prediction is ambiguous under a Pick↔Place counterfactual prompt
-     swap, the wrapper **discards the prediction and re-runs inference
-     blocking** with a fresh flow-matching noise draw. Up to
-     `OOD_MAX_RETRIES=3` retries; on budget exhaustion the last retry is
-     returned (`OOD_PERSISTENT_ACTION=keep_last`).
+  3. **Inference-time control flow (OOD recovery, frame-by-frame)** —
+     when the gripper prediction is ambiguous under a Pick↔Place
+     counterfactual prompt swap, the wrapper **discards the chunk and
+     emits a gripper-safe hold chunk** for one client tick (~100 ms).
+     Because the next `infer()` call from the client carries a fresh
+     observation, retries naturally happen on *new* obs rather than the
+     same one. After `OOD_MAX_HOLDS=3` consecutive holds the wrapper
+     forces a release (returns the original chunk anyway and resets the
+     counter); OOD detection resumes immediately on the next call. The
+     hold chunk has `arm`/`head` deltas at zero and `base` velocity at
+     zero, but `gripper` is set to `obs["state"][5]` so the gripper
+     retains its current position (preventing an unintended close on
+     `action[5]=0.0` under the client's discrete/hybrid threshold of
+     0.5). The counter is also reset on prompt change (episode boundary).
 - **No external services / gated weights are needed at runtime.** The
   PaliGemma tokenizer asset is bundled at
   `.docker_cache/policy_cache/big_vision/paligemma_tokenizer.model`
@@ -227,7 +232,7 @@ Logs from a fresh `./RUN-DOCKER-CONTAINER.sh up` followed by
 (verified 2026-05-01):
 
 ```
-INFO:ood_recovery:OOD recovery ENABLED: threshold=1.150 agg=max hyst=1 retry=True max_retries=3 persistent_action=keep_last strict_pa=True
+INFO:ood_recovery:OOD recovery ENABLED (frame-by-frame hold mode): threshold=1.150 agg=max max_holds=3 crossing_required=True strict_pa=True
 INFO:root:Serving policy config=pi05_hsr_micro_ft checkpoint=/policy_checkpoint on 0.0.0.0:8000
 INFO:runtime_core.websocket_policy_server:Connection from ('127.0.0.1', 45046) opened
 [INFO] [1777608067.238294]: Action executed.
