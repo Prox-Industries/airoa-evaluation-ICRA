@@ -32,6 +32,48 @@ s3://airoa-icra-team-27/
 `norm_stats.json` is reused unchanged from the public baseline at
 `s3://airoa-icra-shared/baseline/100000/assets/lerobot_datasets/task6891011_level12_v2.5_train/norm_stats.json`.
 
+## Quick reproduction (copy-paste)
+
+A single-shell-flow reproduction matching the format requested by the
+organizers. Replace the two `<team-27 ...>` placeholders with the R2
+keys delivered out-of-band, then paste the rest verbatim.
+
+```bash
+# clone + checkout
+git clone https://github.com/Prox-Industries/airoa-evaluation-ICRA.git
+cd airoa-evaluation-ICRA
+git checkout sample-openpi
+
+# download checkpoint from Cloudflare R2 (S3-compatible)
+export AWS_ACCESS_KEY_ID=<team-27 access key>
+export AWS_SECRET_ACCESS_KEY=<team-27 secret>
+export AWS_ENDPOINT_URL=https://eabeb2a5516ef53a191452e5714fc16b.r2.cloudflarestorage.com
+export AWS_REGION=auto
+mkdir -p checkpoint
+aws s3 cp --recursive s3://airoa-icra-team-27/ ./checkpoint/ \
+  --endpoint-url "$AWS_ENDPOINT_URL"
+
+# required runtime env
+export POLICY_CHECKPOINT_PATH=$(pwd)/checkpoint
+export POLICY_CONFIG_NAME=pi05_hsr_micro_ft
+export POLICY_PYTORCH_DEVICE=cuda
+export TEST_MODE=true
+
+# bring up evaluation containers (build + start)
+./RUN-DOCKER-CONTAINER.sh up
+
+# open the client shell and launch the test client
+./RUN-DOCKER-CONTAINER.sh shell
+# inside the client container:
+roslaunch hsr_policy_client hsr_policy_client.launch
+```
+
+Expected log: `Action executed.` (smoke-test loop). The first call takes
+several minutes due to `torch.compile` / Triton autotuning on Blackwell;
+subsequent calls run at roughly 2–5 Hz.
+
+The same flow is documented in detail below.
+
 ## Reproduction Commands
 
 ### 1. Clone and check out
