@@ -7,7 +7,7 @@
 | Team name | Team 27 |
 | Fork URL | https://github.com/Prox-Industries/airoa-evaluation-ICRA |
 | Branch | `sample-openpi` |
-| Commit hash | `6279acdaf784cf40608a0d98591817320d967bf5` (`6279acd`) |
+| Commit hash | branch tip of `sample-openpi` (pinned in the submission email) |
 | Checkpoint path | `s3://airoa-icra-team-27/` (Cloudflare R2) |
 | Endpoint | `https://eabeb2a5516ef53a191452e5714fc16b.r2.cloudflarestorage.com` |
 | Policy config name | `pi05_hsr_micro_ft` |
@@ -40,7 +40,8 @@ s3://airoa-icra-team-27/
 git clone https://github.com/Prox-Industries/airoa-evaluation-ICRA.git
 cd airoa-evaluation-ICRA
 git checkout sample-openpi
-git checkout 6279acd
+# Optionally pin to the exact submission commit (see submission email):
+# git checkout <commit-hash-from-email>
 ```
 
 ### 2. Download the checkpoint from R2
@@ -190,8 +191,9 @@ The following files / directories are kept exactly as upstream
 - `docker-compose.yml` — service composition
 - `client/Dockerfile` — client image (HSR ROS dependencies)
 
-Verifiable with `git diff <upstream-base>..6279acd -- <path>` returning
-empty for each path above.
+Verifiable with `git diff upstream/sample-openpi..origin/sample-openpi -- <path>`
+returning empty for each path above (where `upstream` points at
+`airoa-org/airoa-evaluation-ICRA`).
 
 ## Environment Variables (read by the pipeline)
 
