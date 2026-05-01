@@ -2,12 +2,17 @@
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 
 from openpi.policies import policy as policy_lib
 from openpi.policies import policy_config
 from openpi.training import config as train_config
 from runtime_core.websocket_policy_server import WebsocketPolicyServer
+
+# Local module: server/ood_recovery.py
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ood_recovery import OODRecoveryConfig, OODRecoveryPolicy  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +50,13 @@ def main() -> None:
 
     if args.record_dir:
         policy = policy_lib.PolicyRecorder(policy, args.record_dir)
+
+    # OOD recovery wrapper. Reads OOD_* environment variables; transparent
+    # passthrough when OOD_ENABLED is false. Behaviour: discard the prediction
+    # and re-run inference until the ambiguity score clears the threshold or
+    # max_retries is exhausted. See server/ood_recovery.py.
+    ood_cfg = OODRecoveryConfig.from_env()
+    policy = OODRecoveryPolicy(policy, ood_cfg)
 
     metadata = dict(policy.metadata)
     metadata.update(

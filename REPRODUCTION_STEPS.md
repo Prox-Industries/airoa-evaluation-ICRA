@@ -127,14 +127,59 @@ a defense-in-depth layer; the model itself almost never exceeds the bounds
 after micro-FT, but the clip prevents rare-burst outliers from reaching the
 robot.
 
+### `server/ood_recovery.py` (new)
+
+A blocking OOD-detection-and-retry wrapper around the policy. On every
+inference call:
+
+1. Run inference with the user prompt.
+2. Run inference with the **counterfactual** prompt (Pick<->Place swap of
+   the same object family — exhaustive 3-pair set verified across the
+   3,971 task6911 parquets).
+3. If the gripper-dim disagreement between the two predictions exceeds a
+   threshold (and the predictions land on opposite sides of the 0.5
+   open/close switch), the frame is flagged OOD.
+4. On OOD, **discard the prediction and re-run inference** with a fresh
+   flow-matching noise draw. Loop until either the result clears or
+   `OOD_MAX_RETRIES` is exhausted.
+5. If still OOD after the budget, return the last retry result
+   (`OOD_PERSISTENT_ACTION=keep_last`, default).
+
+The wrapper is transparent passthrough when `OOD_ENABLED=false`.
+
+### `server/serve_hsr_policy_ws.py`
+
+Constructs `OODRecoveryConfig` from the environment and wraps the loaded
+policy with `OODRecoveryPolicy`. Otherwise unchanged from `sample-openpi`.
+
+### `server/Dockerfile`
+
+Adds default `OOD_*` environment variables so the wrapper is on by
+default in the evaluation image. Defaults:
+
+| Variable | Default |
+|---|---|
+| `OOD_ENABLED` | 1 |
+| `OOD_AMBIGUITY_THRESHOLD` | 1.15 |
+| `OOD_CHUNK_AGGREGATION` | max |
+| `OOD_REQUIRE_CROSSING` | 1 |
+| `OOD_RETRY_ON_OOD` | 1 |
+| `OOD_MAX_RETRIES` | 3 |
+| `OOD_PERSISTENT_ACTION` | keep_last |
+| `OOD_MIN_CONSECUTIVE` | 1 |
+| `OOD_PA_STRICT` | 1 |
+
+All overridable via `docker run -e OOD_<KEY>=<VALUE>` if a different
+behaviour is desired during evaluation.
+
 ### Other files
 
 `src/openpi/models/model.py` already filters the tied `embed_tokens.weight`
 key on load (this fix was already on `sample-openpi` and is needed for
 PyTorch checkpoints converted from JAX). No additional changes there.
 
-`server/`, `runtime_core/`, `RUN-DOCKER-CONTAINER.sh`, and
-`docker-compose.yml` are **not modified**.
+`runtime_core/`, `RUN-DOCKER-CONTAINER.sh`, and `docker-compose.yml` are
+**not modified**.
 
 ## Environment Variables (read by the pipeline)
 
@@ -158,10 +203,17 @@ No other extra env vars are required.
 ## Why the submission is not the unmodified baseline
 
 Per Section 13.2 of the competition rules, submitting an unmodified
-baseline is prohibited. The submitted checkpoint is the public baseline
-weights **plus** a rank-8 LoRA correction trained for 1000 steps with an
-axis-weighted Huber loss on the base axes (peak weight on `base_t`) and a
-dim-wise keep-close regularizer toward the frozen baseline. The LoRA delta
-is folded into the weights at submission time. The companion runtime
-guardrail (A1' clip in `_encode_actions`) is the second line of defense
-against rare-burst outliers.
+baseline is prohibited. The submission is modified in three independent
+layers:
+
+1. **Weights**: the public baseline 100K weights + a rank-8 LoRA
+   correction trained for 1000 steps with an axis-weighted Huber loss on
+   the base axes (peak weight on `base_t`) and a dim-wise keep-close
+   regulariser toward the frozen baseline. The LoRA delta is folded into
+   the weights at submission time.
+2. **Action post-processing**: the A1' clip in `_encode_actions`
+   (`base_x/y ±0.3`, `base_t ±1.5`) — second line of defence against
+   rare-burst outliers in the base-velocity axes.
+3. **Inference-time control flow**: `server/ood_recovery.py` wraps the
+   policy with a blocking discard-and-retry loop on counterfactually
+   ambiguous frames (Pick<->Place gripper inversion).
