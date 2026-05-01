@@ -36,7 +36,8 @@ s3://airoa-icra-team-27/
 
 A single-shell-flow reproduction matching the format requested by the
 organizers. Replace the two `<team-27 ...>` placeholders with the R2
-keys delivered out-of-band, then paste the rest verbatim.
+access key and secret that were issued together with the team-specific
+`s3://airoa-icra-team-27/` bucket, then paste the rest verbatim.
 
 ```bash
 # clone + checkout
