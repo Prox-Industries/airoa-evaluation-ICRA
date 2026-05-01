@@ -248,6 +248,13 @@ def _encode_actions(
     if adapt_to_pi:
         if convert_gripper:
             actions[:, 5] = _gripper_from_angular(actions[:, 5])
+    # A1' clip: base velocity guardrail. Bounds match the soft cap that
+    # corrective micro-FT learned for base_t; base_x/y use the same envelope
+    # observed in training.
+    actions = actions.astype(actions.dtype, copy=True)
+    actions[:, 8] = np.clip(actions[:, 8], -0.3, 0.3)
+    actions[:, 9] = np.clip(actions[:, 9], -0.3, 0.3)
+    actions[:, 10] = np.clip(actions[:, 10], -1.5, 1.5)
     return actions
 
 

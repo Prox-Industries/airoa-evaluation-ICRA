@@ -1212,6 +1212,41 @@ _CONFIGS = [
         save_interval=200,
         log_interval=20,
     ),
+    # ICRA 2026 submission: corrective micro-FT on top of baseline 100K.
+    # Used at inference time only (POLICY_CONFIG_NAME=pi05_hsr_micro_ft).
+    # Checkpoint layout expected by serve_hsr_policy_ws.py:
+    #   <checkpoint_dir>/model.safetensors
+    #   <checkpoint_dir>/assets/lerobot_datasets/task6891011_level12_v2.5_train/norm_stats.json
+    TrainConfig(
+        name="pi05_hsr_micro_ft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotHSRDataConfig(
+            repo_id="lerobot_datasets/task6891011_level12_v2.5_train",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_hsr_micro_ft",
+                asset_id="lerobot_datasets/task6891011_level12_v2.5_train",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            action_mode="relative",
+        ),
+        # Inference-only entry; training metadata is unused but required by TrainConfig.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-5,
+            decay_steps=1_000,
+            decay_lr=1e-6,
+        ),
+        batch_size=16,
+        num_workers=4,
+        num_train_steps=1_000,
+        save_interval=200,
+        log_interval=10,
+        ema_decay=None,
+    ),
     #
     # Debugging configs.
     #
