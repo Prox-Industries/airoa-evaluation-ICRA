@@ -7,7 +7,7 @@
 | Team name | Team 27 |
 | Fork URL | https://github.com/Prox-Industries/airoa-evaluation-ICRA |
 | Branch | `sample-openpi` |
-| Commit hash | _filled in at submission time_ |
+| Commit hash | `6279acdaf784cf40608a0d98591817320d967bf5` (`6279acd`) |
 | Checkpoint path | `s3://airoa-icra-team-27/` (Cloudflare R2) |
 | Endpoint | `https://eabeb2a5516ef53a191452e5714fc16b.r2.cloudflarestorage.com` |
 | Policy config name | `pi05_hsr_micro_ft` |
@@ -40,7 +40,7 @@ s3://airoa-icra-team-27/
 git clone https://github.com/Prox-Industries/airoa-evaluation-ICRA.git
 cd airoa-evaluation-ICRA
 git checkout sample-openpi
-git checkout <commit-hash>
+git checkout 6279acd
 ```
 
 ### 2. Download the checkpoint from R2
@@ -178,8 +178,20 @@ behaviour is desired during evaluation.
 key on load (this fix was already on `sample-openpi` and is needed for
 PyTorch checkpoints converted from JAX). No additional changes there.
 
-`runtime_core/`, `RUN-DOCKER-CONTAINER.sh`, and `docker-compose.yml` are
-**not modified**.
+### Files explicitly NOT modified
+
+The following files / directories are kept exactly as upstream
+`airoa-org/airoa-evaluation-ICRA` `sample-openpi`:
+
+- `runtime_core/**` — WebSocket protocol, server harness
+- `deploy/hsr_policy_client/**` — pipeline-managed client logic
+- `packages/policy-client/**` — protocol package
+- `RUN-DOCKER-CONTAINER.sh` — harness entrypoint
+- `docker-compose.yml` — service composition
+- `client/Dockerfile` — client image (HSR ROS dependencies)
+
+Verifiable with `git diff <upstream-base>..6279acd -- <path>` returning
+empty for each path above.
 
 ## Environment Variables (read by the pipeline)
 
