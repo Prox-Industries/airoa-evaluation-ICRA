@@ -252,15 +252,30 @@ class BaseModelConfig(abc.ABC):
             merged_sd = self._merge_lora_state_dict(raw_sd)
             model.load_state_dict(merged_sd, strict=True)
         else:
-            # Filter out unexpected keys (e.g. tied embed_tokens.weight
-            # saved during full fine-tuning but not expected as a separate parameter).
+            # Drop keys present in the checkpoint that the model does not
+            # expect (e.g. tied embed_tokens.weight saved during full FT).
             model_keys = set(model.state_dict().keys())
             unexpected = [k for k in raw_sd if k not in model_keys]
             if unexpected:
                 logger.warning(f"Dropping {len(unexpected)} unexpected key(s) from checkpoint: {unexpected}")
                 for k in unexpected:
                     del raw_sd[k]
-            model.load_state_dict(raw_sd, strict=True)
+            # strict=False: the JAX→PT converter (via safetensors.save_model)
+            # deduplicates tied weights — for example embed_tokens shares storage
+            # with lm_head — so the tied key may be absent in the saved file.
+            # HF transformers re-ties these on module construction, so a missing
+            # tied key is safe.
+            missing, unexpected = model.load_state_dict(raw_sd, strict=False)
+            if missing:
+                logger.warning(
+                    "Missing %d key(s) after load (likely tied weights): %s",
+                    len(missing), missing[:5],
+                )
+            if unexpected:
+                logger.warning(
+                    "Unexpected %d key(s) after load: %s",
+                    len(unexpected), unexpected[:5],
+                )
         return model
 
     @staticmethod
