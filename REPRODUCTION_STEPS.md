@@ -152,6 +152,28 @@ evaluation RTX 5070 Ti. Subsequent calls run at ≈ 2–5 Hz.
 - `client/Dockerfile` — client image (HSR ROS dependencies)
 - `server/entrypoint.sh` — env → CLI mapping (default behaviour preserved)
 
+**Pre-existing fork state, not part of this submission's edits.**
+The `Prox-Industries/airoa-evaluation-ICRA` fork carries some additional
+content from earlier history that pre-dates this submission and is not
+touched by the commits behind this run. Listed here for full audit
+transparency:
+
+| Path | Inference-time use | Note |
+|---|---|---|
+| `src/openpi/models_pytorch/pi0_pytorch.py` | yes | Fork-level adjustments to the `PI0Pytorch` module that are part of the inference path. |
+| `src/openpi/transforms.py` | yes | Fork-level adjustments to the transform stack used at inference. |
+| `src/openpi/training/data_loader.py` | no | Training-time only. |
+| `src/openpi/training/train.py` | no | Training-time only. |
+| `src/openpi/training/configs/my_robot_pi05_lora.py` | no | LoRA fine-tuning training config (not invoked at inference). |
+| `convert_my_data_to_lerobot.py`, `scripts/compute_norm_stats.py`, `run_train_my_robot_pi05_lora.sh`, `README_my_robot_pi05_lora.md` | no | LoRA fine-tuning helpers (data conversion + training shell scripts). |
+| `.docker_cache/policy_cache/big_vision/paligemma_tokenizer.model` | yes | Bundled PaliGemma tokenizer (~4 MB), used at inference; see §5 for details. |
+| `.gitignore` | no | Repo metadata only. |
+
+These files are not modified by this submission's commits and are part
+of the fork's existing default branch. The OpenPI inference loader path
+exercised by `POLICY_CONFIG_NAME=pi05_hsr_micro_ft` does not invoke any
+of the training-only files above.
+
 ---
 
 ## 5. Important notes
