@@ -230,6 +230,30 @@ class OODRecoveryPolicy:
             is_amb = is_amb and crossing
         return is_amb, score, crossing
 
+    def _sanitize_output(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Enforce the ICRA action-output contract on the returned chunk.
+
+        The competition rules require ``actions`` to be a 2-D ``np.ndarray``
+        of shape ``(T, 11)`` with ``dtype=float32`` and all finite values
+        (`docs/REPRODUCTION_STEPS.template.md` §3, FAQ §3.2). The base
+        OpenPI policy already produces sane output; this is a defensive
+        fail-safe so a single bad frame from any layer above can never
+        violate the contract.
+
+        - cast to float32
+        - lift (11,) → (1, 11) if a 1-D action ever escapes
+        - replace NaN/+Inf/-Inf with 0.0 (gripper-safe: arm/head/base
+          neutral, gripper closes — but only when the model has already
+          gone rogue, which we should never see at inference time anyway)
+        """
+        actions = np.asarray(result["actions"], dtype=np.float32)
+        if actions.ndim == 1:
+            actions = actions[None, :]
+        if not np.isfinite(actions).all():
+            actions = np.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0)
+        result["actions"] = actions
+        return result
+
     def _make_hold_action(self, T: int, obs: dict[str, Any]) -> np.ndarray:
         """Gripper-safe hold chunk.
 
@@ -250,7 +274,7 @@ class OODRecoveryPolicy:
 
         if not self._config.enabled:
             self.stats["skipped_disabled"] += 1
-            return self._base.infer(obs)
+            return self._sanitize_output(self._base.infer(obs))
 
         prompt = obs.get("prompt") if isinstance(obs, dict) else None
 
@@ -275,7 +299,7 @@ class OODRecoveryPolicy:
                 "applied": False, "reason": "unknown_pa",
                 "consecutive_ood": 0,
             }
-            return result
+            return self._sanitize_output(result)
 
         is_ood, score, crossing = self._check_ood(result, cf_prompt, obs)
 
@@ -295,7 +319,7 @@ class OODRecoveryPolicy:
                     "OOD clear: pa=%s score=%.4f crossing=%s",
                     pa_verb, score, crossing,
                 )
-            return result
+            return self._sanitize_output(result)
 
         # OOD detected.
         self.stats["ood_detected"] += 1
@@ -324,7 +348,7 @@ class OODRecoveryPolicy:
                     pa_verb, self._consecutive_ood_count, self._config.max_holds,
                     score, float(hold[0, GRIPPER_DIM]),
                 )
-            return result
+            return self._sanitize_output(result)
 
         # Budget exhausted: release, reset counter, OOD detection resumes
         # immediately on the next call.
@@ -344,4 +368,4 @@ class OODRecoveryPolicy:
                 "counter reset, detection resumes next call",
                 pa_verb, self._config.max_holds,
             )
-        return result
+        return self._sanitize_output(result)
